@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "google-workspace"
+version = "0.1.0"
+description = "Shared Google Workspace API toolkit for all projects"
+requires-python = ">=3.11"
+dependencies = [
+    "google-auth>=2.0",
+    "google-auth-oauthlib>=1.0",
+    "google-api-python-client>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
