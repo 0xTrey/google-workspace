@@ -1,116 +1,111 @@
-"""
-Google Tasks tools (read-only).
-
-Usage:
-    from google_workspace.tasks import list_task_lists, list_tasks, get_all_tasks
-
-    lists = list_task_lists()
-    tasks = list_tasks(tasklist_id="MTIzNDU2Nzg5MA")
-    all_tasks = get_all_tasks(show_completed=False)
-"""
+"""Google Tasks API wrapper."""
 
 from __future__ import annotations
 
-from typing import Optional
+from datetime import datetime, timedelta, timezone
 
 from google_workspace.auth import build_service
 
 
-def _service():
-    return build_service("tasks", "v1")
+def list_tasks(days: int = 7) -> list[dict]:
+    """Return recently updated or recently completed tasks across tasklists."""
+    service = build_service("tasks", "v1")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(0, days))
+
+    tasklists = _list_tasklists(service)
+    tasks: list[dict] = []
+
+    for tasklist in tasklists:
+        for task in _list_tasks(service, tasklist["id"], show_completed=True):
+            updated = _parse_rfc3339(task.get("updated"))
+            completed = _parse_rfc3339(task.get("completed"))
+            if (updated and updated >= cutoff) or (completed and completed >= cutoff):
+                tasks.append(_normalize_task(task, tasklist))
+
+    tasks.sort(key=lambda task: task.get("updated", ""), reverse=True)
+    return tasks
 
 
-def list_task_lists() -> list[dict]:
-    """List all task lists.
+def get_overdue_tasks() -> list[dict]:
+    """Return incomplete tasks with a due date before now across tasklists."""
+    service = build_service("tasks", "v1")
+    now = datetime.now(timezone.utc)
 
-    Returns list of dicts with: id, title, updated.
-    """
-    results = _service().tasklists().list(maxResults=100).execute()
+    tasklists = _list_tasklists(service)
+    overdue: list[dict] = []
 
-    return [
-        {
-            "id": tl["id"],
-            "title": tl.get("title", ""),
-            "updated": tl.get("updated", ""),
-        }
-        for tl in results.get("items", [])
-    ]
+    for tasklist in tasklists:
+        for task in _list_tasks(service, tasklist["id"], show_completed=False):
+            due = _parse_rfc3339(task.get("due"))
+            if due and due < now and task.get("status") != "completed":
+                overdue.append(_normalize_task(task, tasklist))
+
+    overdue.sort(key=lambda task: task.get("due", ""))
+    return overdue
 
 
-def list_tasks(
-    tasklist_id: str,
-    show_completed: bool = False,
-    max_results: int = 100,
-) -> list[dict]:
-    """List tasks from a specific task list.
-
-    Args:
-        tasklist_id: The task list ID.
-        show_completed: Include completed tasks.
-        max_results: Max tasks to return.
-
-    Returns list of dicts with: id, title, notes, status, due, completed,
-        updated, parent, position, list_id, list_title.
-    """
-    svc = _service()
-    all_items = []
-    page_token = None
+def _list_tasklists(service) -> list[dict]:
+    tasklists: list[dict] = []
+    page_token: str | None = None
 
     while True:
-        result = svc.tasks().list(
-            tasklist=tasklist_id,
-            showCompleted=show_completed,
-            showHidden=show_completed,
-            maxResults=min(max_results - len(all_items), 100),
-            pageToken=page_token,
-        ).execute()
-
-        all_items.extend(result.get("items", []))
-        page_token = result.get("nextPageToken")
-
-        if not page_token or len(all_items) >= max_results:
+        response = service.tasklists().list(maxResults=100, pageToken=page_token).execute()
+        tasklists.extend(response.get("items", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
             break
 
-    return [
-        {
-            "id": t["id"],
-            "title": t.get("title", ""),
-            "notes": t.get("notes", ""),
-            "status": t.get("status", ""),
-            "due": t.get("due", ""),
-            "completed": t.get("completed", ""),
-            "updated": t.get("updated", ""),
-            "parent": t.get("parent", ""),
-            "position": t.get("position", ""),
-        }
-        for t in all_items
-    ]
+    return tasklists
 
 
-def get_all_tasks(
-    show_completed: bool = False,
-    max_per_list: int = 100,
-) -> list[dict]:
-    """Get tasks from all task lists, with list name attached.
+def _list_tasks(service, tasklist_id: str, *, show_completed: bool) -> list[dict]:
+    tasks: list[dict] = []
+    page_token: str | None = None
 
-    Args:
-        show_completed: Include completed tasks.
-        max_per_list: Max tasks per list.
-
-    Returns list of dicts: same as list_tasks() plus list_id, list_title.
-    """
-    task_lists = list_task_lists()
-    all_tasks = []
-
-    for tl in task_lists:
-        tasks = list_tasks(
-            tl["id"],
-            show_completed=show_completed,
-            max_results=max_per_list,
+    while True:
+        response = (
+            service.tasks()
+            .list(
+                tasklist=tasklist_id,
+                maxResults=100,
+                pageToken=page_token,
+                showCompleted=show_completed,
+                showHidden=False,
+                showDeleted=False,
+            )
+            .execute()
         )
-        for t in tasks:
-            t["list_id"] = tl["id"]
-            t["list_title"] = tl["title"]
-        all_tasks.extend(tasks)
+        tasks.extend(response.get("items", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
 
-    return all_tasks
+    return tasks
+
+
+def _normalize_task(task: dict, tasklist: dict) -> dict:
+    return {
+        "id": task.get("id"),
+        "title": task.get("title", ""),
+        "due": task.get("due"),
+        "status": task.get("status", ""),
+        "notes": task.get("notes", ""),
+        "updated": task.get("updated"),
+        "tasklist_id": tasklist.get("id"),
+        "tasklist_title": tasklist.get("title", ""),
+    }
+
+
+def _parse_rfc3339(value: str | None) -> datetime | None:
+    if not value:
+        return None
+
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)

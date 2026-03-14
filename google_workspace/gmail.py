@@ -1,183 +1,182 @@
-"""
-Gmail tools.
-
-Usage:
-    from google_workspace.gmail import search_messages, get_thread, get_profile
-
-    messages = search_messages("from:someone@company.com", days=7)
-    thread = get_thread(thread_id)
-"""
+"""Google Gmail API wrapper."""
 
 from __future__ import annotations
 
 import base64
-import re
-from datetime import datetime, timedelta
-from email.utils import parseaddr
-from typing import Optional
+import email.mime.multipart
+import email.mime.text
 
 from google_workspace.auth import build_service
 
 
-def _service():
-    return build_service("gmail", "v1")
+def send_email(to: str, subject: str, body_html: str, body_text: str = "") -> dict:
+    """
+    Send an email from the authenticated Gmail account.
+
+    Args:
+        to: recipient email address
+        subject: email subject line
+        body_html: HTML body (primary)
+        body_text: plain text fallback (optional)
+
+    Returns the Gmail API send response (id, threadId, labelIds).
+    """
+    service = build_service("gmail", "v1")
+
+    msg = email.mime.multipart.MIMEMultipart("alternative")
+    msg["To"] = to
+    msg["Subject"] = subject
+
+    if body_text:
+        msg.attach(email.mime.text.MIMEText(body_text, "plain"))
+    msg.attach(email.mime.text.MIMEText(body_html, "html"))
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    return service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
 def get_profile() -> dict:
-    """Get the authenticated user's Gmail profile."""
-    profile = _service().users().getProfile(userId="me").execute()
-    return {
-        "email": profile.get("emailAddress", ""),
-        "messages_total": profile.get("messagesTotal", 0),
-        "threads_total": profile.get("threadsTotal", 0),
-    }
+    """Return the authenticated Gmail profile."""
+    service = build_service("gmail", "v1")
+    return service.users().getProfile(userId="me").execute()
 
 
-def search_messages(
-    query: str,
-    days: Optional[int] = None,
-    max_results: int = 50,
-) -> list[dict]:
-    """Search Gmail messages.
+def search_messages(query: str, days: int = 7) -> list[dict]:
+    """Search messages with a recency filter and return normalized summaries."""
+    service = build_service("gmail", "v1")
+    recency = f"newer_than:{max(0, days)}d"
+    full_query = f"{query} {recency}".strip()
 
-    Args:
-        query: Gmail search query (same syntax as the Gmail search bar).
-               Examples: "from:someone@co.com", "subject:proposal", "is:unread"
-        days: If set, appends "after:YYYY/MM/DD" to the query.
-        max_results: Max messages to return.
+    results: list[dict] = []
+    page_token: str | None = None
 
-    Returns list of dicts with: id, thread_id, subject, sender, date, snippet.
-    """
-    svc = _service()
+    while True:
+        response = (
+            service.users()
+            .messages()
+            .list(userId="me", q=full_query, pageToken=page_token)
+            .execute()
+        )
 
-    if days:
-        after = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
-        query = f"{query} after:{after}"
+        for item in response.get("messages", []):
+            message = (
+                service.users()
+                .messages()
+                .get(userId="me", id=item["id"], format="metadata")
+                .execute()
+            )
+            results.append(_normalize_message_summary(message))
 
-    results = svc.users().messages().list(
-        userId="me", q=query, maxResults=max_results,
-    ).execute()
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
 
-    message_refs = results.get("messages", [])
-    messages = []
-
-    for ref in message_refs:
-        msg = svc.users().messages().get(
-            userId="me", id=ref["id"], format="metadata",
-            metadataHeaders=["Subject", "From", "Date"],
-        ).execute()
-
-        headers = {
-            h["name"].lower(): h["value"]
-            for h in msg.get("payload", {}).get("headers", [])
-        }
-
-        messages.append({
-            "id": msg["id"],
-            "thread_id": msg.get("threadId", ""),
-            "subject": headers.get("subject", ""),
-            "sender": headers.get("from", ""),
-            "date": headers.get("date", ""),
-            "snippet": msg.get("snippet", ""),
-            "label_ids": msg.get("labelIds", []),
-        })
-
-    return messages
+    return results
 
 
 def get_message(message_id: str) -> dict:
-    """Fetch a single message with full body text.
+    """Return a parsed Gmail message."""
+    service = build_service("gmail", "v1")
+    message = (
+        service.users().messages().get(userId="me", id=message_id, format="full").execute()
+    )
 
-    Returns dict with: id, thread_id, subject, sender, date, body, label_ids.
-    """
-    svc = _service()
-    msg = svc.users().messages().get(
-        userId="me", id=message_id, format="full",
-    ).execute()
-
-    headers = {
-        h["name"].lower(): h["value"]
-        for h in msg.get("payload", {}).get("headers", [])
-    }
-
-    body = _extract_body(msg.get("payload", {}))
+    headers = _headers_map(message.get("payload", {}).get("headers", []))
+    text_body, html_body = _extract_bodies(message.get("payload", {}))
 
     return {
-        "id": msg["id"],
-        "thread_id": msg.get("threadId", ""),
-        "subject": headers.get("subject", ""),
-        "sender": headers.get("from", ""),
-        "date": headers.get("date", ""),
-        "body": body,
-        "label_ids": msg.get("labelIds", []),
+        "id": message.get("id"),
+        "threadId": message.get("threadId"),
+        "labelIds": message.get("labelIds", []),
+        "snippet": message.get("snippet", ""),
+        "internalDate": message.get("internalDate"),
+        "headers": headers,
+        "body": text_body,
+        "bodyHtml": html_body,
+        "payload": {
+            "mimeType": message.get("payload", {}).get("mimeType", ""),
+            "filename": message.get("payload", {}).get("filename", ""),
+            "partCount": len(message.get("payload", {}).get("parts", [])),
+        },
     }
 
 
 def get_thread(thread_id: str) -> dict:
-    """Fetch a full Gmail thread with all messages.
+    """Return thread metadata with normalized message summaries."""
+    service = build_service("gmail", "v1")
+    thread = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
 
-    Returns dict with: id, subject, messages[].
-    Each message has: sender, sender_email, date, body, is_me.
-    """
-    svc = _service()
-    user_email = get_profile()["email"]
-    user_domain = user_email.split("@")[1] if "@" in user_email else ""
-
-    thread = svc.users().threads().get(userId="me", id=thread_id).execute()
-    messages_raw = thread.get("messages", [])
-
-    subject = ""
     messages = []
-
-    for msg in messages_raw:
-        headers = {
-            h["name"].lower(): h["value"]
-            for h in msg.get("payload", {}).get("headers", [])
-        }
-
-        if not subject:
-            subject = headers.get("subject", "")
-
-        sender = headers.get("from", "")
-        _, sender_email = parseaddr(sender)
-        sender_domain = sender_email.split("@")[1] if "@" in sender_email else ""
-
-        messages.append({
-            "id": msg["id"],
-            "sender": sender,
-            "sender_email": sender_email,
-            "date": headers.get("date", ""),
-            "body": _extract_body(msg.get("payload", {})),
-            "is_me": sender_domain == user_domain,
-        })
+    for message in thread.get("messages", []):
+        headers = _headers_map(message.get("payload", {}).get("headers", []))
+        messages.append(
+            {
+                **_normalize_message_summary(message),
+                "headers": {
+                    "subject": headers.get("subject", ""),
+                    "from": headers.get("from", ""),
+                    "to": headers.get("to", ""),
+                    "date": headers.get("date", ""),
+                },
+            }
+        )
 
     return {
-        "id": thread_id,
-        "subject": subject,
+        "id": thread.get("id"),
+        "historyId": thread.get("historyId"),
+        "snippet": thread.get("snippet", ""),
         "messages": messages,
     }
 
 
-def _extract_body(payload: dict) -> str:
-    """Extract plain text body from a message payload."""
+def _normalize_message_summary(message: dict) -> dict:
+    headers = _headers_map(message.get("payload", {}).get("headers", []))
+    return {
+        "id": message.get("id"),
+        "threadId": message.get("threadId"),
+        "snippet": message.get("snippet", ""),
+        "internalDate": message.get("internalDate"),
+        "labelIds": message.get("labelIds", []),
+        "subject": headers.get("subject", ""),
+        "from": headers.get("from", ""),
+        "to": headers.get("to", ""),
+        "date": headers.get("date", ""),
+    }
+
+
+def _headers_map(headers: list[dict]) -> dict:
+    mapped: dict[str, str] = {}
+    for header in headers:
+        name = str(header.get("name", "")).lower()
+        if name:
+            mapped[name] = header.get("value", "")
+    return mapped
+
+
+def _extract_bodies(payload: dict) -> tuple[str, str]:
+    text_body = ""
+    html_body = ""
+
     mime_type = payload.get("mimeType", "")
-    body = payload.get("body", {})
-    parts = payload.get("parts", [])
+    data = payload.get("body", {}).get("data")
+    if data:
+        decoded = _decode_base64(data)
+        if mime_type == "text/plain":
+            text_body = decoded
+        elif mime_type == "text/html":
+            html_body = decoded
 
-    if mime_type == "text/plain" and body.get("data"):
-        text = base64.urlsafe_b64decode(body["data"]).decode("utf-8", errors="ignore")
-        return re.sub(r"\n{3,}", "\n\n", text.strip())
+    for part in payload.get("parts", []):
+        part_text, part_html = _extract_bodies(part)
+        if not text_body and part_text:
+            text_body = part_text
+        if not html_body and part_html:
+            html_body = part_html
 
-    if parts:
-        for part in parts:
-            if part.get("mimeType") == "text/plain":
-                part_body = part.get("body", {})
-                if part_body.get("data"):
-                    text = base64.urlsafe_b64decode(part_body["data"]).decode("utf-8", errors="ignore")
-                    return re.sub(r"\n{3,}", "\n\n", text.strip())
-            if part.get("mimeType", "").startswith("multipart/"):
-                result = _extract_body(part)
-                if result:
-                    return result
+    return text_body, html_body
 
-    return ""
+
+def _decode_base64(data: str) -> str:
+    padding = "=" * (-len(data) % 4)
+    decoded = base64.urlsafe_b64decode(data + padding)
+    return decoded.decode("utf-8", errors="replace")

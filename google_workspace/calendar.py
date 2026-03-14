@@ -1,150 +1,103 @@
-"""
-Google Calendar tools.
-
-Usage:
-    from google_workspace.calendar import list_events, get_event
-
-    events = list_events(days=7)
-    event = get_event(event_id)
-"""
+"""Google Calendar API wrapper."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import date, datetime, timedelta, timezone
 
 from google_workspace.auth import build_service
 
 
-def _service():
-    return build_service("calendar", "v3")
-
-
-def list_events(
-    days: int = 7,
-    calendar_id: str = "primary",
-    max_results: int = 250,
-    query: Optional[str] = None,
-) -> list[dict]:
-    """Fetch calendar events for the past N days.
-
-    Returns list of dicts with: id, summary, start, end, attendees,
-    organizer, status, html_link, color_id.
-    """
+def list_events(days: int = 7) -> list[dict]:
+    """Return events from the previous `days` days."""
     now = datetime.now(timezone.utc)
-    time_min = (now - timedelta(days=days)).isoformat()
+    time_min = (now - timedelta(days=max(0, days))).isoformat()
     time_max = now.isoformat()
-
-    kwargs = dict(
-        calendarId=calendar_id,
-        timeMin=time_min,
-        timeMax=time_max,
-        singleEvents=True,
-        orderBy="startTime",
-        maxResults=max_results,
-    )
-    if query:
-        kwargs["q"] = query
-
-    results = _service().events().list(**kwargs).execute()
-    events = results.get("items", [])
-
-    return [
-        {
-            "id": e.get("id"),
-            "summary": e.get("summary", "(no title)"),
-            "start": e.get("start", {}).get("dateTime", e.get("start", {}).get("date")),
-            "end": e.get("end", {}).get("dateTime", e.get("end", {}).get("date")),
-            "attendees": [
-                {
-                    "email": a.get("email"),
-                    "name": a.get("displayName", ""),
-                    "response": a.get("responseStatus", ""),
-                    "self": a.get("self", False),
-                }
-                for a in e.get("attendees", [])
-            ],
-            "organizer": e.get("organizer", {}).get("email", ""),
-            "status": e.get("status", ""),
-            "html_link": e.get("htmlLink", ""),
-            "color_id": e.get("colorId"),
-            "description": e.get("description", ""),
-            "location": e.get("location", ""),
-        }
-        for e in events
-    ]
+    events = _list_events_window(time_min=time_min, time_max=time_max)
+    return _sort_events(events)
 
 
-def list_upcoming_events(
-    days: int = 7,
-    calendar_id: str = "primary",
-    max_results: int = 250,
-    query: Optional[str] = None,
-) -> list[dict]:
-    """Fetch calendar events for the next N days (future-looking)."""
+def list_upcoming_events(days: int = 7) -> list[dict]:
+    """Return events in the next `days` days."""
     now = datetime.now(timezone.utc)
     time_min = now.isoformat()
-    time_max = (now + timedelta(days=days)).isoformat()
-
-    kwargs = dict(
-        calendarId=calendar_id,
-        timeMin=time_min,
-        timeMax=time_max,
-        singleEvents=True,
-        orderBy="startTime",
-        maxResults=max_results,
-    )
-    if query:
-        kwargs["q"] = query
-
-    results = _service().events().list(**kwargs).execute()
-    events = results.get("items", [])
-
-    return [
-        {
-            "id": e.get("id"),
-            "summary": e.get("summary", "(no title)"),
-            "start": e.get("start", {}).get("dateTime", e.get("start", {}).get("date")),
-            "end": e.get("end", {}).get("dateTime", e.get("end", {}).get("date")),
-            "attendees": [
-                {
-                    "email": a.get("email"),
-                    "name": a.get("displayName", ""),
-                    "response": a.get("responseStatus", ""),
-                    "self": a.get("self", False),
-                }
-                for a in e.get("attendees", [])
-            ],
-            "organizer": e.get("organizer", {}).get("email", ""),
-            "status": e.get("status", ""),
-            "html_link": e.get("htmlLink", ""),
-            "color_id": e.get("colorId"),
-            "description": e.get("description", ""),
-            "location": e.get("location", ""),
-        }
-        for e in events
-    ]
+    time_max = (now + timedelta(days=max(0, days))).isoformat()
+    events = _list_events_window(time_min=time_min, time_max=time_max)
+    return _sort_events(events)
 
 
-def get_event(event_id: str, calendar_id: str = "primary") -> dict:
-    """Fetch a single calendar event by ID."""
-    e = _service().events().get(calendarId=calendar_id, eventId=event_id).execute()
+def get_event(event_id: str) -> dict:
+    """Return a single event by ID."""
+    service = build_service("calendar", "v3")
+    event = service.events().get(calendarId="primary", eventId=event_id).execute()
+    return _normalize_event(event)
+
+
+def _list_events_window(*, time_min: str, time_max: str) -> list[dict]:
+    service = build_service("calendar", "v3")
+    events: list[dict] = []
+    page_token: str | None = None
+
+    while True:
+        response = (
+            service.events()
+            .list(
+                calendarId="primary",
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy="startTime",
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        events.extend(_normalize_event(item) for item in response.get("items", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return events
+
+
+def _normalize_event(event: dict) -> dict:
     return {
-        "id": e.get("id"),
-        "summary": e.get("summary", "(no title)"),
-        "start": e.get("start", {}).get("dateTime", e.get("start", {}).get("date")),
-        "end": e.get("end", {}).get("dateTime", e.get("end", {}).get("date")),
-        "attendees": [
-            {
-                "email": a.get("email"),
-                "name": a.get("displayName", ""),
-                "response": a.get("responseStatus", ""),
-            }
-            for a in e.get("attendees", [])
-        ],
-        "organizer": e.get("organizer", {}).get("email", ""),
-        "description": e.get("description", ""),
-        "location": e.get("location", ""),
-        "html_link": e.get("htmlLink", ""),
-        "color_id": e.get("colorId"),
+        "id": event.get("id"),
+        "summary": event.get("summary", ""),
+        "start": _extract_event_time(event.get("start", {})),
+        "end": _extract_event_time(event.get("end", {})),
+        "status": event.get("status", ""),
+        "htmlLink": event.get("htmlLink", ""),
+        "organizer": event.get("organizer"),
+        "attendees": event.get("attendees", []),
+        "location": event.get("location", ""),
+        "description": event.get("description", ""),
     }
+
+
+def _extract_event_time(value: dict) -> str:
+    return value.get("dateTime") or value.get("date") or ""
+
+
+def _sort_events(events: list[dict]) -> list[dict]:
+    return sorted(events, key=lambda event: _sort_key(event.get("start", "")))
+
+
+def _sort_key(raw_start: str) -> datetime:
+    if not raw_start:
+        return datetime.max.replace(tzinfo=timezone.utc)
+
+    if "T" in raw_start:
+        return _parse_datetime(raw_start)
+
+    try:
+        day = date.fromisoformat(raw_start)
+        return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    except ValueError:
+        return datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _parse_datetime(value: str) -> datetime:
+    normalized = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)

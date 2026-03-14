@@ -1,110 +1,90 @@
-"""
-Google Docs tools.
-
-Usage:
-    from google_workspace.docs import create_doc, read_doc, append_text
-
-    doc_id, url = create_doc("My Doc", folder_id="abc123")
-    content = read_doc(doc_id)
-    append_text(doc_id, "New paragraph here.")
-"""
+"""Google Docs API wrapper."""
 
 from __future__ import annotations
-
-from typing import Optional
 
 from google_workspace.auth import build_service
 
 
-def _docs():
-    return build_service("docs", "v1")
+def create_doc(title: str, folder_id: str = None) -> tuple[str, str]:
+    """Create a document and optionally move it to a Drive folder."""
+    docs_service = build_service("docs", "v1")
+    drive_service = build_service("drive", "v3")
 
-
-def _drive():
-    return build_service("drive", "v3")
-
-
-def create_doc(
-    title: str,
-    folder_id: Optional[str] = None,
-) -> tuple[str, str]:
-    """Create a new Google Doc.
-
-    Args:
-        title: Document title.
-        folder_id: Drive folder ID to move the doc into.
-
-    Returns:
-        (document_id, document_url)
-    """
-    doc = _docs().documents().create(body={"title": title}).execute()
-    doc_id = doc["documentId"]
+    created = docs_service.documents().create(body={"title": title}).execute()
+    doc_id = created["documentId"]
 
     if folder_id:
-        drive = _drive()
-        file = drive.files().get(fileId=doc_id, fields="parents").execute()
-        prev_parents = ",".join(file.get("parents", []))
-        drive.files().update(
-            fileId=doc_id,
-            addParents=folder_id,
-            removeParents=prev_parents,
-            fields="id, parents",
-        ).execute()
+        file_meta = drive_service.files().get(fileId=doc_id, fields="parents").execute()
+        previous_parents = ",".join(file_meta.get("parents", []))
+        update_kwargs = {
+            "fileId": doc_id,
+            "addParents": folder_id,
+            "fields": "id,parents",
+        }
+        if previous_parents:
+            update_kwargs["removeParents"] = previous_parents
+        drive_service.files().update(**update_kwargs).execute()
 
-    url = f"https://docs.google.com/document/d/{doc_id}/edit"
-    return doc_id, url
+    return doc_id, f"https://docs.google.com/document/d/{doc_id}/edit"
 
 
 def read_doc(doc_id: str) -> str:
-    """Read the full text content of a Google Doc.
-
-    Returns the document text as a plain string.
-    """
-    doc = _docs().documents().get(documentId=doc_id).execute()
-    content = doc.get("body", {}).get("content", [])
-
-    text_parts = []
-    for element in content:
-        paragraph = element.get("paragraph")
-        if not paragraph:
-            continue
-        for elem in paragraph.get("elements", []):
-            text_run = elem.get("textRun")
-            if text_run:
-                text_parts.append(text_run.get("content", ""))
-
-    return "".join(text_parts)
+    """Read a Google Doc and return plain text."""
+    docs_service = build_service("docs", "v1")
+    document = docs_service.documents().get(documentId=doc_id).execute()
+    body_content = document.get("body", {}).get("content", [])
+    return _extract_text_from_elements(body_content)
 
 
 def append_text(doc_id: str, text: str) -> None:
-    """Append text to the end of a Google Doc."""
-    doc = _docs().documents().get(documentId=doc_id).execute()
-    end_index = doc["body"]["content"][-1]["endIndex"] - 1
+    """Append plain text at the end of a Google Doc."""
+    if not text:
+        return
 
-    _docs().documents().batchUpdate(
-        documentId=doc_id,
-        body={
-            "requests": [
-                {
-                    "insertText": {
-                        "location": {"index": end_index},
-                        "text": text,
-                    }
-                }
-            ]
-        },
-    ).execute()
+    docs_service = build_service("docs", "v1")
+    document = docs_service.documents().get(documentId=doc_id).execute()
+    content = document.get("body", {}).get("content", [])
+    end_index = content[-1].get("endIndex", 1) - 1 if content else 1
+
+    requests = [
+        {
+            "insertText": {
+                "location": {"index": max(1, end_index)},
+                "text": text,
+            }
+        }
+    ]
+    docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
 
 
-def batch_update(doc_id: str, requests: list[dict]) -> dict:
-    """Send a raw batchUpdate to a Google Doc.
-
-    For advanced formatting (headings, bold, links, etc.) pass
-    a list of request dicts per the Docs API spec.
-
-    Returns the batchUpdate response.
-    """
-    return _docs().documents().batchUpdate(
+def batch_update(doc_id: str, requests: list) -> None:
+    """Execute a Docs batchUpdate request list."""
+    docs_service = build_service("docs", "v1")
+    docs_service.documents().batchUpdate(
         documentId=doc_id,
         body={"requests": requests},
     ).execute()
+
+
+def _extract_text_from_elements(elements: list[dict]) -> str:
+    pieces: list[str] = []
+
+    for element in elements:
+        paragraph = element.get("paragraph")
+        if paragraph:
+            for paragraph_element in paragraph.get("elements", []):
+                text_run = paragraph_element.get("textRun")
+                if text_run:
+                    pieces.append(text_run.get("content", ""))
+
+        table = element.get("table")
+        if table:
+            for row in table.get("tableRows", []):
+                for cell in row.get("tableCells", []):
+                    pieces.append(_extract_text_from_elements(cell.get("content", [])))
+
+        toc = element.get("tableOfContents")
+        if toc:
+            pieces.append(_extract_text_from_elements(toc.get("content", [])))
+
+    return "".join(pieces)

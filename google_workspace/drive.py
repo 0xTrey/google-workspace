@@ -1,150 +1,99 @@
-"""
-Google Drive tools.
-
-Usage:
-    from google_workspace.drive import list_files, get_file, search_files
-
-    files = list_files(folder_id="abc123")
-    content = get_file_text(file_id)
-"""
+"""Google Drive API wrapper."""
 
 from __future__ import annotations
 
-from typing import Optional
+import io
+
+from googleapiclient.http import MediaIoBaseDownload
 
 from google_workspace.auth import build_service
 
 
-def _service():
-    return build_service("drive", "v3")
+def list_files(folder_id: str) -> list[dict]:
+    """List files in a Drive folder."""
+    query = f"'{folder_id}' in parents and trashed = false"
+    return _list_files(query)
 
 
-def list_files(
-    folder_id: Optional[str] = None,
-    mime_type: Optional[str] = None,
-    max_results: int = 100,
-    order_by: str = "modifiedTime desc",
-) -> list[dict]:
-    """List files in Drive, optionally filtered by folder or type.
-
-    Args:
-        folder_id: Restrict to this folder.
-        mime_type: Filter by MIME type (e.g. "application/vnd.google-apps.document").
-        max_results: Max files to return.
-        order_by: Sort order.
-
-    Returns list of dicts with: id, name, mime_type, modified_time, web_link.
-    """
-    query_parts = ["trashed = false"]
-    if folder_id:
-        query_parts.append(f"'{folder_id}' in parents")
-    if mime_type:
-        query_parts.append(f"mimeType = '{mime_type}'")
-
-    q = " and ".join(query_parts)
-
-    results = _service().files().list(
-        q=q,
-        pageSize=max_results,
-        orderBy=order_by,
-        fields="files(id, name, mimeType, modifiedTime, webViewLink, parents)",
-    ).execute()
-
-    return [
-        {
-            "id": f["id"],
-            "name": f.get("name", ""),
-            "mime_type": f.get("mimeType", ""),
-            "modified_time": f.get("modifiedTime", ""),
-            "web_link": f.get("webViewLink", ""),
-            "parents": f.get("parents", []),
-        }
-        for f in results.get("files", [])
-    ]
-
-
-def search_files(
-    query: str,
-    max_results: int = 50,
-) -> list[dict]:
-    """Search Drive files by name.
-
-    Args:
-        query: Text to search for in file names.
-        max_results: Max files to return.
-    """
-    q = f"name contains '{query}' and trashed = false"
-
-    results = _service().files().list(
-        q=q,
-        pageSize=max_results,
-        fields="files(id, name, mimeType, modifiedTime, webViewLink)",
-    ).execute()
-
-    return [
-        {
-            "id": f["id"],
-            "name": f.get("name", ""),
-            "mime_type": f.get("mimeType", ""),
-            "modified_time": f.get("modifiedTime", ""),
-            "web_link": f.get("webViewLink", ""),
-        }
-        for f in results.get("files", [])
-    ]
-
-
-def get_file_metadata(file_id: str) -> dict:
-    """Get metadata for a single file."""
-    f = _service().files().get(
-        fileId=file_id,
-        fields="id, name, mimeType, modifiedTime, webViewLink, parents, size",
-    ).execute()
-
-    return {
-        "id": f["id"],
-        "name": f.get("name", ""),
-        "mime_type": f.get("mimeType", ""),
-        "modified_time": f.get("modifiedTime", ""),
-        "web_link": f.get("webViewLink", ""),
-        "parents": f.get("parents", []),
-        "size": f.get("size", ""),
-    }
+def search_files(query: str) -> list[dict]:
+    """Search Drive files using Drive query syntax."""
+    return _list_files(query)
 
 
 def get_file_text(file_id: str) -> str:
-    """Download a file's content as plain text.
+    """Return plain text for Google Docs or plain text files."""
+    service = build_service("drive", "v3")
+    metadata = service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
+    mime_type = metadata.get("mimeType", "")
 
-    Works for Google Docs (exported as text/plain) and text files.
-    """
-    svc = _service()
+    if mime_type == "application/vnd.google-apps.document":
+        exported = service.files().export(fileId=file_id, mimeType="text/plain").execute()
+        if isinstance(exported, bytes):
+            return exported.decode("utf-8", errors="replace")
+        return str(exported)
 
-    # Check MIME type to decide export vs download
-    meta = svc.files().get(fileId=file_id, fields="mimeType").execute()
-    mime = meta.get("mimeType", "")
+    if mime_type.startswith("text/"):
+        request = service.files().get_media(fileId=file_id)
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return buffer.getvalue().decode("utf-8", errors="replace")
 
-    if mime.startswith("application/vnd.google-apps."):
-        # Google native format -- export as plain text
-        content = svc.files().export(fileId=file_id, mimeType="text/plain").execute()
-        if isinstance(content, bytes):
-            return content.decode("utf-8", errors="ignore")
-        return str(content)
-    else:
-        # Regular file -- download
-        content = svc.files().get_media(fileId=file_id).execute()
-        if isinstance(content, bytes):
-            return content.decode("utf-8", errors="ignore")
-        return str(content)
+    raise ValueError(f"Unsupported file type for text extraction: {mime_type}")
 
 
-def move_file(file_id: str, new_folder_id: str) -> None:
-    """Move a file to a different folder."""
-    svc = _service()
-    file = svc.files().get(fileId=file_id, fields="parents").execute()
-    prev_parents = ",".join(file.get("parents", []))
+def move_file(file_id: str, folder_id: str) -> None:
+    """Move a Drive file to a folder, preserving parent semantics."""
+    service = build_service("drive", "v3")
+    file_meta = service.files().get(fileId=file_id, fields="parents").execute()
+    previous_parents = ",".join(file_meta.get("parents", []))
 
-    svc.files().update(
-        fileId=file_id,
-        addParents=new_folder_id,
-        removeParents=prev_parents,
-        fields="id, parents",
-    ).execute()
+    update_kwargs = {
+        "fileId": file_id,
+        "addParents": folder_id,
+        "fields": "id,parents",
+    }
+    if previous_parents:
+        update_kwargs["removeParents"] = previous_parents
+
+    service.files().update(**update_kwargs).execute()
+
+
+def _list_files(query: str) -> list[dict]:
+    service = build_service("drive", "v3")
+    files: list[dict] = []
+    page_token: str | None = None
+
+    while True:
+        response = (
+            service.files()
+            .list(
+                q=query,
+                pageToken=page_token,
+                pageSize=100,
+                fields=(
+                    "nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink,parents)"
+                ),
+            )
+            .execute()
+        )
+
+        files.extend(_normalize_file(item) for item in response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return files
+
+
+def _normalize_file(file_obj: dict) -> dict:
+    return {
+        "id": file_obj.get("id"),
+        "name": file_obj.get("name", ""),
+        "mimeType": file_obj.get("mimeType", ""),
+        "modifiedTime": file_obj.get("modifiedTime", ""),
+        "webViewLink": file_obj.get("webViewLink", ""),
+        "parents": file_obj.get("parents", []),
+    }
